@@ -23,6 +23,8 @@ from telegram.ext import (
 # Активные переписки в памяти. Это отдельная переменная.
 active_chats = {}
 
+reply_map = {}
+
 # Заблокированные пользователи
 banned_users = set()
 
@@ -1024,25 +1026,23 @@ async def buyer_choose_seller(update: Update, context: ContextTypes.DEFAULT_TYPE
 @cancel_if_requested
 async def buyer_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Обработка первого сообщения покупателя продавцу."""
-    message_text = update.message.text.strip()
     buyer_id = update.effective_user.id
-
-    # Получаем выбранного продавца
+    message = update.message.text.strip()
+    
     seller = context.user_data.get("selected_seller")
     if not seller:
-        await update.message.reply_text("❌ Продавец не выбран. Попробуйте снова.")
+        await update.message.reply_text("❌ Продавец не выбран.")
         return ConversationHandler.END
 
     seller_id = seller[0]
 
-    # Устанавливаем связь в active_chats
+    # Устанавливаем связь
     active_chats[buyer_id] = seller_id
     active_chats[seller_id] = buyer_id
+    reply_map[seller_id] = buyer_id
 
-    # Сохраняем ID покупателя в user_data продавца
-    context.user_data["reply_to"] = buyer_id
-
-    # Получаем ник покупателя
+    # Получаем nickname покупателя
+    import sqlite3
     conn = sqlite3.connect(Config.DATABASE)
     cursor = conn.cursor()
     cursor.execute("SELECT nickname FROM users WHERE user_id = ?", (buyer_id,))
@@ -1050,20 +1050,18 @@ async def buyer_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     buyer_nickname = row[0] if row and row[0] else f"id:{buyer_id}"
     conn.close()
 
-    # Сообщаем продавцу, кто с ним связался
+    # Уведомляем продавца
     await context.bot.send_message(
         chat_id=seller_id,
         text=f"💬 Покупатель *{buyer_nickname}* отправил вам сообщение:\n\n"
-             f"{message_text}",
+             f"{message}",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("✏️ Ответить", callback_data=f"reply_to_{buyer_id}")]
         ])
     )
 
-    # Отправляем пользователю подтверждение
-    await update.message.reply_text("✅ Ваше сообщение отправлено продавцу. Ожидайте ответа.")
-
+    await update.message.reply_text("✅ Ваше сообщение отправлено продавцу.")
     return DIALOG
 
 @cancel_if_requested
@@ -1073,23 +1071,14 @@ async def seller_reply_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.answer()
 
     try:
-        # Извлекаем ID покупателя из callback_data
-        data = query.data  # Пример: "reply_to_12345678"
-        buyer_id = int(data.split("_")[2])
+        buyer_id = int(query.data.split('_')[2])
+        context.user_data['reply_to'] = buyer_id
 
-        # Сохраняем ID покупателя в user_data продавца
-        context.user_data["reply_to"] = buyer_id
-
-        logger.info(f"📥 Нажата кнопка 'Ответить': data = {data}, от = {query.from_user.id}")
-        logger.info(f"💬 reply_to установлен как {buyer_id} для пользователя {query.from_user.id}")
-
-        await query.message.reply_text("✏️ Напишите ответ покупателю:")
-        logger.warning("🔁 Переход в состояние REPLY_TO_BUYER")
+        await query.message.reply_text("✏️ Напишите сообщение покупателю:")
         return REPLY_TO_BUYER
-
     except Exception as e:
         logger.error(f"❌ Ошибка в seller_reply_start: {e}")
-        await query.message.reply_text("❌ Не удалось начать ответ. Попробуйте позже.")
+        await query.message.reply_text("❌ Не удалось начать диалог.")
         return ConversationHandler.END
 
 @cancel_if_requested
@@ -1098,37 +1087,32 @@ async def seller_send_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     logger.warning("🔔 seller_send_reply() был вызван")
 
     seller_id = update.effective_user.id
-    message_text = update.message.text.strip()
     buyer_id = context.user_data.get("reply_to")
+    message = update.message.text.strip()
+
     logger.warning(f"📥 reply_to из user_data = {buyer_id}")
 
     buyer_id = active_chats.get(seller_id)
 
     if not buyer_id:
-        await update.message.reply_text("❌ Нет активного диалога с покупателем.")
+        await update.message.reply_text("❌ Ошибка: ID покупателя не найден.")
         return ConversationHandler.END
 
-    # Получаем ник продавца
+    # Получаем nickname продавца
     conn = sqlite3.connect(Config.DATABASE)
     cursor = conn.cursor()
-    cursor.execute("SELECT nickname FROM sellers WHERE user_id = ?", (seller_id,))
+    cursor.execute("SELECT nickname FROM sellers WHERE user_id = ? ORDER BY seller_id DESC LIMIT 1", (seller_id,))
     row = cursor.fetchone()
     seller_nickname = row[0] if row and row[0] else f"id:{seller_id}"
     conn.close()
 
-    # Отправляем сообщение покупателю
     await context.bot.send_message(
         chat_id=buyer_id,
-        text=f"💬 Продавец *{seller_nickname}* ответил вам:\n\n{message_text}",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✏️ Ответить", callback_data=f"reply_to_{seller_id}")]
-        ])
+        text=f"📨 Ответ от продавца *{seller_nickname}*:\n\n{message}",
+        parse_mode="Markdown"
     )
 
-    # Подтверждение отправки продавцу
-    await update.message.reply_text("✅ Сообщение отправлено покупателю.")
-
+    await update.message.reply_text("✅ Сообщение отправлено.")
     return DIALOG
 # async def confirm_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #     query = update.callback_query
