@@ -96,10 +96,10 @@ def log_sql(query, params=None):
     SELLER_AD_TYPE, SELLER_SCREENSHOT, SELLER_CONFIRM,
     BUYER_PLATFORM, SELLER_NICKNAME, BUYER_CHOOSE_SELLER, BUYER_MESSAGE,
     REJECT_REASON, ADMIN_PANEL, SELLER_CUSTOM_AD_TYPE,
-    SELLER_REPLY, DIALOG, SELLER_USERCODE, SHOW_SELLER_PROFILE,
+    REPLY_TO_BUYER, DIALOG, SELLER_USERCODE, SHOW_SELLER_PROFILE,
     CHOOSE_BUYER_NICKNAME
 ) = range(21)
-# Здесь был REPLY_TO_BUYER вместо SELLER_REPLY
+# Здесь был SELLER_REPLY вместо REPLY_TO_BUYER
 
 
 # --- Клавиатуры ---
@@ -1021,6 +1021,115 @@ async def buyer_choose_seller(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
         return BUYER_CHOOSE_SELLER
 
+@cancel_if_requested
+async def buyer_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработка первого сообщения покупателя продавцу."""
+    message_text = update.message.text.strip()
+    buyer_id = update.effective_user.id
+
+    # Получаем выбранного продавца
+    seller = context.user_data.get("selected_seller")
+    if not seller:
+        await update.message.reply_text("❌ Продавец не выбран. Попробуйте снова.")
+        return ConversationHandler.END
+
+    seller_id = seller[0]
+
+    # Устанавливаем связь в active_chats
+    active_chats[buyer_id] = seller_id
+    active_chats[seller_id] = buyer_id
+
+    # Сохраняем ID покупателя в user_data продавца
+    context.user_data["reply_to"] = buyer_id
+
+    # Получаем ник покупателя
+    conn = sqlite3.connect(Config.DATABASE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT nickname FROM users WHERE user_id = ?", (buyer_id,))
+    row = cursor.fetchone()
+    buyer_nickname = row[0] if row and row[0] else f"id:{buyer_id}"
+    conn.close()
+
+    # Сообщаем продавцу, кто с ним связался
+    await context.bot.send_message(
+        chat_id=seller_id,
+        text=f"💬 Покупатель *{buyer_nickname}* отправил вам сообщение:\n\n"
+             f"{message_text}",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✏️ Ответить", callback_data=f"reply_to_{buyer_id}")]
+        ])
+    )
+
+    # Отправляем пользователю подтверждение
+    await update.message.reply_text("✅ Ваше сообщение отправлено продавцу. Ожидайте ответа.")
+
+    return DIALOG
+
+@cancel_if_requested
+async def seller_reply_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработка нажатия на кнопку 'Ответить' от продавца."""
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        # Извлекаем ID покупателя из callback_data
+        data = query.data  # Пример: "reply_to_12345678"
+        buyer_id = int(data.split("_")[2])
+
+        # Сохраняем ID покупателя в user_data продавца
+        context.user_data["reply_to"] = buyer_id
+
+        logger.info(f"📥 Нажата кнопка 'Ответить': data = {data}, от = {query.from_user.id}")
+        logger.info(f"💬 reply_to установлен как {buyer_id} для пользователя {query.from_user.id}")
+
+        await query.message.reply_text("✏️ Напишите ответ покупателю:")
+        logger.warning("🔁 Переход в состояние REPLY_TO_BUYER")
+        return REPLY_TO_BUYER
+
+    except Exception as e:
+        logger.error(f"❌ Ошибка в seller_reply_start: {e}")
+        await query.message.reply_text("❌ Не удалось начать ответ. Попробуйте позже.")
+        return ConversationHandler.END
+
+@cancel_if_requested
+async def seller_send_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработка ответа продавца покупателю."""
+    logger.warning("🔔 seller_send_reply() был вызван")
+
+    seller_id = update.effective_user.id
+    message_text = update.message.text.strip()
+    buyer_id = context.user_data.get("reply_to")
+    logger.warning(f"📥 reply_to из user_data = {buyer_id}")
+
+    buyer_id = active_chats.get(seller_id)
+
+    if not buyer_id:
+        await update.message.reply_text("❌ Нет активного диалога с покупателем.")
+        return ConversationHandler.END
+
+    # Получаем ник продавца
+    conn = sqlite3.connect(Config.DATABASE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT nickname FROM sellers WHERE user_id = ?", (seller_id,))
+    row = cursor.fetchone()
+    seller_nickname = row[0] if row and row[0] else f"id:{seller_id}"
+    conn.close()
+
+    # Отправляем сообщение покупателю
+    await context.bot.send_message(
+        chat_id=buyer_id,
+        text=f"💬 Продавец *{seller_nickname}* ответил вам:\n\n{message_text}",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✏️ Ответить", callback_data=f"reply_to_{seller_id}")]
+        ])
+    )
+
+    # Подтверждение отправки продавцу
+    await update.message.reply_text("✅ Сообщение отправлено покупателю.")
+
+    return DIALOG
 # async def confirm_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #     query = update.callback_query
 #     await query.answer()
@@ -1055,20 +1164,20 @@ async def buyer_choose_seller(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 #     await query.edit_message_text(f"❌ Сделка #{deal_id} была отменена.")
 
-# async def end_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-#     uid = update.effective_user.id
-#     companion = active_chats.pop(uid, None)
+async def end_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    companion = active_chats.pop(uid, None)
 
-#     if companion:
-#         active_chats.pop(companion, None)
-#         await context.bot.send_message(companion, "🔕 Собеседник завершил диалог.", reply_markup=get_default_keyboard())
+    if companion:
+        active_chats.pop(companion, None)
+        await context.bot.send_message(companion, "🔕 Собеседник завершил диалог.", reply_markup=get_default_keyboard())
 
-#     await update.message.reply_text(
-#         "✅ Диалог завершён.",
-#         reply_markup=ReplyKeyboardRemove()
-#     )
+    await update.message.reply_text(
+        "✅ Диалог завершён.",
+        reply_markup=ReplyKeyboardRemove()
+    )
 
-#     return ConversationHandler.END
+    return ConversationHandler.END
 
 # async def send_deal_intro(receiver_id: int, context: ContextTypes.DEFAULT_TYPE):
 #     text = (
@@ -1279,12 +1388,12 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         conn.close() if 'conn' in locals() else None
 
-# async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-#     """Завершение диалога."""
-#     await update.message.reply_text(
-#         "🗑 Диалог завершен. Нажмите /start чтобы начать заново.",
-#         reply_markup=get_default_keyboard())
-#     return ConversationHandler.END
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Завершение диалога."""
+    await update.message.reply_text(
+        "🗑 Диалог завершен. Нажмите /start чтобы начать заново.",
+        reply_markup=get_default_keyboard())
+    return ConversationHandler.END
 
 # --- Главная функция ---
 def main() -> None:
@@ -1295,68 +1404,77 @@ def main() -> None:
     
     # Обработчик диалога
     conv_handler = ConversationHandler(
-    entry_points=[
-        CommandHandler('start', start),
-        CallbackQueryHandler(admin_action, pattern=r'^(approve|reject)_\d+$'),
-        CallbackQueryHandler(start_dialog_from_profile, pattern="^start_dialog$"),
-        CallbackQueryHandler(buyer_platform, pattern="^back_to_platforms$")
-    ],
-    states={
-        CHECK_SUBSCRIPTION: [
-            CallbackQueryHandler(check_subscription, pattern='^check_subscription$'),
-            CallbackQueryHandler(start, pattern='^start$')
+        entry_points=[
+            CommandHandler('start', start),
+            CallbackQueryHandler(admin_action, pattern=r'^(approve|reject)_\d+$'),
+            CallbackQueryHandler(start_dialog_from_profile, pattern="^start_dialog$"),
+            CallbackQueryHandler(buyer_platform, pattern="^back_to_platforms$"),
+            CallbackQueryHandler(seller_reply_start, pattern=r"^reply_to_\d+$")
         ],
-        CHOOSE_ROLE: [
-            CallbackQueryHandler(choose_role, pattern='^(seller|buyer|back_to_start)$')
-        ],
-        SELLER_PLATFORM: [
-            CallbackQueryHandler(seller_platform, pattern='^(tiktok|youtube|instagram|vk|twitch|back_to_roles)$')
-        ],
-        SELLER_AUDIENCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, seller_audience)],
-        SELLER_THEME: [MessageHandler(filters.TEXT & ~filters.COMMAND, seller_theme)],
-        SELLER_VIEWS: [MessageHandler(filters.TEXT & ~filters.COMMAND, seller_views)],
-        SELLER_AD_TYPE: [CallbackQueryHandler(seller_ad_type)],
-        SELLER_SCREENSHOT: [MessageHandler(filters.PHOTO | filters.Document.IMAGE | filters.TEXT, seller_screenshot)],
-        SELLER_CONFIRM: [CallbackQueryHandler(seller_confirm, pattern='^(confirm|edit)_application$')],
-        SELLER_USERCODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, seller_usercode)],
-        SELLER_NICKNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, seller_nickname)],
+        states={
+            CHECK_SUBSCRIPTION: [
+                CallbackQueryHandler(check_subscription, pattern='^check_subscription$'),
+                CallbackQueryHandler(start, pattern='^start$')
+            ],
+            CHOOSE_ROLE: [
+                CallbackQueryHandler(choose_role, pattern='^(seller|buyer|back_to_start)$')
+            ],
+            SELLER_PLATFORM: [
+                CallbackQueryHandler(seller_platform, pattern='^(tiktok|youtube|instagram|vk|twitch|back_to_roles)$')
+            ],
+            SELLER_AUDIENCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, seller_audience)],
+            SELLER_THEME: [MessageHandler(filters.TEXT & ~filters.COMMAND, seller_theme)],
+            SELLER_VIEWS: [MessageHandler(filters.TEXT & ~filters.COMMAND, seller_views)],
+            SELLER_AD_TYPE: [CallbackQueryHandler(seller_ad_type)],
+            SELLER_SCREENSHOT: [MessageHandler(filters.PHOTO | filters.Document.IMAGE | filters.TEXT, seller_screenshot)],
+            SELLER_CONFIRM: [CallbackQueryHandler(seller_confirm, pattern='^(confirm|edit)_application$')],
+            SELLER_USERCODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, seller_usercode)],
+            SELLER_NICKNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, seller_nickname)],
 
-        BUYER_PLATFORM: [
-            CallbackQueryHandler(buyer_platform, pattern='^(tiktok|youtube|instagram|vk|twitch|another_platform|back_to_roles)$')
-        ],
+            BUYER_PLATFORM: [
+                CallbackQueryHandler(buyer_platform, pattern='^(tiktok|youtube|instagram|vk|twitch|another_platform|back_to_roles)$')
+            ],
 
-        BUYER_CHOOSE_SELLER: [MessageHandler(filters.TEXT & ~filters.COMMAND, buyer_choose_seller)],
-        BUYER_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, buyer_message)],
+            BUYER_CHOOSE_SELLER: [MessageHandler(filters.TEXT & ~filters.COMMAND, buyer_choose_seller)],
+
+            CHOOSE_BUYER_NICKNAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, save_buyer_nickname),
+                CallbackQueryHandler(buyer_nickname_keep, pattern="^keep_nickname")
+            ],
+
+            REJECT_REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND, reject_reason)],
+            SELLER_CUSTOM_AD_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, seller_custom_ad_type)],
         
-        CHOOSE_BUYER_NICKNAME: [
-            MessageHandler(filters.TEXT & ~filters.COMMAND, save_buyer_nickname),
-            CallbackQueryHandler(buyer_nickname_keep, pattern="^keep_nickname")
-        ],
+            # 🔍 Профили
+            SHOW_SELLER_PROFILE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, show_seller_profile),
+                CallbackQueryHandler(toggle_sort, pattern="^toggle_sort$"),
+                CallbackQueryHandler(buyer_platform, pattern="^back_to_roles$")
+            ],
 
-        REJECT_REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND, reject_reason)],
-        SELLER_CUSTOM_AD_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, seller_custom_ad_type)],
-        
-        # 🔍 Профили
-        SHOW_SELLER_PROFILE: [
-            MessageHandler(filters.TEXT & ~filters.COMMAND, show_seller_profile),
-            CallbackQueryHandler(toggle_sort, pattern="^toggle_sort$"),
-            CallbackQueryHandler(buyer_platform, pattern="^back_to_roles$")
+            BUYER_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, buyer_message)],
+
+            REPLY_TO_BUYER: [MessageHandler(filters.TEXT & ~filters.COMMAND, seller_send_reply)],
+
+            DIALOG: [
+                MessageHandler(filters.TEXT & filters.Regex("^(❌ Завершить диалог)$"), end_chat)
+                # MessageHandler(filters.TEXT & ~filters.COMMAND, dialog_handler)
+            ],
+        },
+        fallbacks=[
+            CommandHandler('cancel', cancel),
+            CommandHandler('end_chat', end_chat),
+            CallbackQueryHandler(cancel, pattern='^cancel$'),
         ],
-    },
-    fallbacks=[
-        CommandHandler('cancel', cancel),
-        CommandHandler('end_chat', end_chat),
-        CallbackQueryHandler(cancel, pattern='^cancel$'),
-    ],
-    per_message=False,  # ❗ теперь обязательно
-    per_chat=False,
-    per_user=True
-)
+        per_message=False,
+        per_chat=False,
+        per_user=True
+    )
 
     # application.add_handler(CallbackQueryHandler(start_dialog_from_profile, pattern="^start_dialog$"))
     # application.add_handler(CallbackQueryHandler(start, pattern="^back_to_start$"))
 
-    application.add_handler(CallbackQueryHandler(seller_reply_start, pattern=r"^reply_to_\d+$"))
+    # application.add_handler(CallbackQueryHandler(seller_reply_start, pattern=r"^reply_to_\d+$"))
 
     application.add_handler(CommandHandler('help', help_command))
 
