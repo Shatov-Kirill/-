@@ -53,24 +53,15 @@ sqlite3.register_adapter(datetime, adapt_datetime)
 
 CANCEL_KEYWORDS = ['отмена', 'стоп']
 def cancel_if_requested(func):
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        # Обрабатываем только сообщения (не callback'и)
-        message = update.message
+    async def wrapper(*args, **kwargs):
+        update = args[0] if args else None
+        context = args[1] if len(args) > 1 else None
 
-        #Если не текстовое сообщение пропускаем проверку
-        if not message or not message.text:
-            return await func(update, context)
-        
-        text = update.message.text.strip().lower()  
+        if isinstance(update, Update) and update.message and update.message.text == "❌ Отмена":
+            await update.message.reply_text("🚫 Действие отменено.")
+            return await start(update, context)
 
-        if text in CANCEL_KEYWORDS:  
-            user = update.effective_user  
-            context.user_data.clear()  
-            print(f"[ОТМЕНА] Пользователь {user.id} отменил процесс.")  
-            await update.message.reply_text("❌ Заявка отменена. Вы можете начать заново командой /start.")  
-            return ConversationHandler.END  
-
-        return await func(update, context)  
+        return await func(*args, **kwargs)
     return wrapper
 
 def get_default_keyboard():
@@ -99,8 +90,9 @@ def log_sql(query, params=None):
     BUYER_PLATFORM, SELLER_NICKNAME, BUYER_CHOOSE_SELLER, BUYER_MESSAGE,
     REJECT_REASON, ADMIN_PANEL, SELLER_CUSTOM_AD_TYPE,
     REPLY_TO_BUYER, DIALOG, SELLER_USERCODE, SHOW_SELLER_PROFILE,
-    CHOOSE_BUYER_NICKNAME
-) = range(21)
+    CHOOSE_BUYER_NICKNAME, WAITING_FOR_RATING, WAITING_FOR_COMMENT,
+    AWAITING_REQUISITES, WAITING_FOR_SCREENSHOT, WAITING_FOR_COMPLAINT
+) = range(26)
 # Здесь был SELLER_REPLY вместо REPLY_TO_BUYER
 
 
@@ -136,8 +128,10 @@ KEYBOARDS = {
 #Кнопка завершения диалога. Она находится под полем ввода сообщения в телеграмме.
 dialog_keyboard = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton("💰 Начать оплату"), KeyboardButton("💼 Эксроу-счет")],
-        [KeyboardButton("❌ Завершить диалог")]
+        [KeyboardButton("💰 Начать оплату"), KeyboardButton("💼 Эксроу-счёт")],
+        [KeyboardButton("❌ Завершить диалог")],
+        [KeyboardButton("✉️ Написать другим продавцам")],
+        [KeyboardButton("⭐ Завершить сделку")]
     ],
     resize_keyboard=True,
     one_time_keyboard=False
@@ -933,16 +927,26 @@ async def show_seller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Получаем данные продавца
     conn = sqlite3.connect(Config.DATABASE)
     cursor = conn.cursor()
-    cursor.execute('''SELECT nickname, platform_usercode, audience, views, ad_type, deals, rating
+
+    cursor.execute('''SELECT nickname, platform_usercode, audience, views, ad_type
                       FROM sellers WHERE user_id=? ORDER BY seller_id DESC LIMIT 1''', (seller[0],))
-    row = cursor.fetchone()
+    seller_data = cursor.fetchone()
+
+    # Считаем завершённые сделки
+    cursor.execute("SELECT COUNT(*) FROM deals WHERE seller_id=? AND rating IS NOT NULL", (seller[0],))
+    deals_count = cursor.fetchone()[0]
+
+    # Считаем среднюю оценку
+    cursor.execute("SELECT AVG(rating) FROM deals WHERE seller_id=? AND rating IS NOT NULL", (seller[0],))
+    avg_rating = cursor.fetchone()[0]
+
     conn.close()
 
-    if not row:
+    if not seller_data:
         await update.message.reply_text("❌ Профиль продавца не найден.")
         return BUYER_PLATFORM
 
-    nickname, usercode, audience, views, ad_type, deals, rating = row
+    nickname, usercode, audience, views, ad_type = seller_data
 
     profile_text = (
         f"👤 *{nickname}*\n"
@@ -950,16 +954,16 @@ async def show_seller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"👥 Аудитория: {audience}\n"
         f"👁 Просмотры: {views}\n"
         f"📢 Реклама: {ad_type}\n"
-        f"🤝 Сделок: {deals or 0}\n"
-        f"⭐️ Оценка: {rating or 'неизвестно'}"
+        f"🤝 Сделок: {deals_count}\n"
+        f"⭐️ Оценка: {round(avg_rating, 1) if avg_rating else 'неизвестно'}"
     )
 
     seller_user_id = seller[0]
 
     await update.message.reply_text(profile_text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([
         [InlineKeyboardButton("✉️ Написать", callback_data="start_dialog")],
-        [InlineKeyboardButton("◀️ Другие продавцы", callback_data="back_to_platforms")],
-        [InlineKeyboardButton("📝 Комментарии", callback_data=f"view_comments_{seller_user_id}")]
+        [InlineKeyboardButton("📝 Комментарии", callback_data=f"view_comments_{seller_user_id}")],
+        [InlineKeyboardButton("◀️ Другие продавцы", callback_data="back_to_platforms")]
     ]))
     return ConversationHandler.END
 
@@ -1028,6 +1032,8 @@ async def buyer_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     """Обработка первого сообщения покупателя продавцу."""
     buyer_id = update.effective_user.id
     message = update.message.text.strip()
+
+    context.user_data["is_buyer"] = True
     
     seller = context.user_data.get("selected_seller")
     if not seller:
@@ -1040,6 +1046,7 @@ async def buyer_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     active_chats[buyer_id] = seller_id
     active_chats[seller_id] = buyer_id
     reply_map[seller_id] = buyer_id
+    reply_map[buyer_id] = seller_id
 
     # Получаем nickname покупателя
     import sqlite3
@@ -1061,7 +1068,18 @@ async def buyer_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         ])
     )
 
-    await update.message.reply_text("✅ Ваше сообщение отправлено продавцу.")
+    sender_user = await context.bot.get_chat(buyer_id)
+    receiver_user = await context.bot.get_chat(seller[0])
+
+    sender_name = f"@{sender_user.username}" if sender_user.username else sender_user.full_name
+    receiver_name = f"@{receiver_user.username}" if receiver_user.username else receiver_user.full_name
+    await context.bot.send_message(
+            chat_id=Config.ADMIN_CHAT_ID,
+            text=f"📨 [Диалог]\nОт {sender_name} ➡️ {receiver_name}:\n\n{message}"
+        )
+
+    await update.message.reply_text("✅ Ваше сообщение отправлено продавцу. Ожидайте ответа.")
+
     return DIALOG
 
 @cancel_if_requested
@@ -1069,6 +1087,8 @@ async def seller_reply_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     """Обработка нажатия на кнопку 'Ответить' от продавца."""
     query = update.callback_query
     await query.answer()
+
+    context.user_data["is_buyer"] = True
 
     try:
         buyer_id = int(query.data.split('_')[2])
@@ -1092,6 +1112,9 @@ async def seller_send_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     logger.warning(f"📥 reply_to из user_data = {buyer_id}")
 
+    sender_user = await context.bot.get_chat(seller_id)
+    receiver_user = await context.bot.get_chat(buyer_id)
+
     buyer_id = active_chats.get(seller_id)
 
     if not buyer_id:
@@ -1112,134 +1135,696 @@ async def seller_send_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         parse_mode="Markdown"
     )
 
+    await send_dialog_info(buyer_id, context)
+    await send_dialog_info(seller_id, context)
+
+    sender_name = f"@{sender_user.username}" if sender_user.username else sender_user.full_name
+    receiver_name = f"@{receiver_user.username}" if receiver_user.username else receiver_user.full_name
+    await context.bot.send_message(
+            chat_id=Config.ADMIN_CHAT_ID,
+            text=f"📨 [Диалог]\nОт {sender_name} ➡️ {receiver_name}:\n\n{message}"
+        )
+
     await update.message.reply_text("✅ Сообщение отправлено.")
     return DIALOG
-# async def confirm_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-#     query = update.callback_query
-#     await query.answer()
 
-#     print("🔔 confirm_deal triggered")
+@cancel_if_requested
+async def dialog_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if context.user_data.get("awaiting_payment_screenshot") and update.message.photo:
+        return await receive_screenshot(update, context)
 
-#     deal_id = int(query.data.split("_")[-1])
+    if not update.message or not update.message.text:
+        logger.warning("Получено не текст - возможно, фото.")
+        return DIALOG
+
+    text = update.message.text.strip()
+    sender_id = update.effective_user.id
     
-#     # Тут обновление статуса сделки в БД
-#     conn = sqlite3.connect(Config.DATABASE)
-#     cursor = conn.cursor()
-#     cursor.execute("UPDATE deals SET status = 'confirmed' WHERE deal_id = ?", (deal_id,))
-#     conn.commit()
-#     conn.close()
+    logger.warning(f"💬 dialog_handler() от {sender_id} | Текст: {text}")
 
-#     await query.edit_message_text(f"✅ Сделка #{deal_id} подтверждена.")
+    #Если ждём реквизиты от продавца - перенапраляем в нужную функцию
+    if context.user_data.get("awaiting_requisites_from") == sender_id:
+        context.user_data.pop("awaiting_requisites_from", None)
+        return await receive_requisites(update, context)
 
-# async def cancel_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-#     query = update.callback_query
-#     await query.answer()
+    logger.warning(f"📸 Фото пришло? {bool(update.message.photo)}, Флаг: {context.user_data.get('awaiting_payment_screenshot')}")
 
-#     print("🔔 cancel_deal triggered")
+    is_buyer = context.user_data.get("is_buyer", False)
+    # is_seller = context.user_data.get("is_seller", True)
 
-#     deal_id = int(query.data.split("_")[-1])
+    # Получаем ID собеседника
+    receiver_id = active_chats.get(sender_id)
+    if not receiver_id:
+        await update.message.reply_text("❌ Собеседник не найден или диалог уже завершён.")
+        return ConversationHandler.END
     
-#     # Обновляем статус сделки
-#     conn = sqlite3.connect(Config.DATABASE)
-#     cursor = conn.cursor()
-#     cursor.execute("UPDATE deals SET status = 'cancelled' WHERE deal_id = ?", (deal_id,))
-#     conn.commit()
-#     conn.close()
+    if sender_id not in active_chats:
+        # ПРОБУЕМ ВОССТАНОВИТЬ СВЯЗЬ ЧЕРЕЗ reply_map, ЕСЛИ ЧТО-ТО СЛОМАЛОСЬ
+        peer_id = reply_map.get(sender_id)
+        if peer_id:
+            active_chats[sender_id] = peer_id
+            active_chats[peer_id] = sender_id
+            logger.warning(f"🔁 Восстановлена связь между {sender_id} и {peer_id}")
+        else:
+            await update.message.reply_map("❌ Собеседник не найдек.")
+            return ConversationHandler.END 
 
-#     await query.edit_message_text(f"❌ Сделка #{deal_id} была отменена.")
+    # Получаем объекты чатов
+    try:
+        sender_user = await context.bot.get_chat(sender_id)
+        receiver_user = await context.bot.get_chat(receiver_id)
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения чатов: {e}")
+        return ConversationHandler.END
 
-async def end_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    companion = active_chats.pop(uid, None)
+    sender_nickname = await get_nickname_by_user_id(sender_id)
+    receiver_nickname = await get_nickname_by_user_id(receiver_id)
 
-    if companion:
-        active_chats.pop(companion, None)
-        await context.bot.send_message(companion, "🔕 Собеседник завершил диалог.", reply_markup=get_default_keyboard())
+    sender_name = f"@{sender_user.username}" if sender_user.username else sender_user.full_name
+    receiver_name = f"@{receiver_user.username}" if receiver_user.username else receiver_user.full_name
+    
+    if not context.user_data.get("deal_confirmed"):
+        # Показываем кнопки для начала сделки
+        keyboard = ReplyKeyboardMarkup([
+            [KeyboardButton("💰 Начать оплату"), KeyboardButton("💼 Эксроу-счёт")],
+            [KeyboardButton("❌ Завершить диалог"), KeyboardButton("⭐️ Завершить сделку")],
+            [KeyboardButton("✉️ Написать другим продавцам")]
+        ], resize_keyboard=True)
+    else:
+        # Показываем клавиатуру после подтверждения сделки
+        keyboard = ReplyKeyboardMarkup([
+            [KeyboardButton("❌ Завершить диалог"), KeyboardButton("⭐️ Завершить сделку")],
+            [KeyboardButton("✉️ Написать другим продавцам")],
+            [KeyboardButton("🚨 Жалоба")]
+        ], resize_keyboard=True)
 
-    await update.message.reply_text(
-        "✅ Диалог завершён.",
-        reply_markup=ReplyKeyboardRemove()
+    # Отправляем сообщение собеседнику
+    try:
+        await context.bot.send_message(
+            chat_id=receiver_id,
+            text=f"💬 Новое сообщение от *{sender_nickname}*:\n\n{text}",
+            reply_markup=dialog_keyboard
+        )
+
+        await context.bot.send_message(
+            chat_id=Config.ADMIN_CHAT_ID,
+            text=f"📨 [Диалог]\nОт {sender_name} ➡️ {receiver_name}:\n\n{text}"
+        )
+
+        # Нормализуем текст: убираем пробелы и делаем нижний регистр
+        text_normalized = text.strip().lower()
+
+        # Определяем тип оплаты
+        payment_type = None
+        if "начать оплату" in text_normalized:
+            payment_type = "direct"
+        elif "эксроу" in text_normalized:
+            payment_type = "escrow"
+
+        logger.warning(f"💡 Проверка типа оплаты: текст='{text_normalized}', payment_type={payment_type}")
+        
+        # Создание сделки
+        if payment_type:
+            try:
+                deal_id = await create_new_deal(sender_id, receiver_id, payment_type)
+                context.user_data["active_deal_id"] = deal_id
+
+                context.user_data["deal_confirmed"] = False
+
+                context.user_data["is_buyer"] = True
+                context.user_data["is_seller"] = False
+
+                # Отправка предложения другому участнику
+                await context.bot.send_message(
+                    chat_id=receiver_id,
+                    text=f"🤝 Собеседник предложил начать сделку через *{('эксроу-счёт' if payment_type == 'escrow' else 'начать оплату')}*.\nХотите подтвердить?",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("✅ Подтвердить", callback_data=f"confirm_deal_{deal_id}")],
+                        [InlineKeyboardButton("❌ Отказаться", callback_data=f"cancel_deal_{deal_id}")]
+                ])
+            )
+
+                await update.message.reply_text("⏳ Ожидаем подтверждения от собеседника.")
+                return DIALOG
+
+            except Exception as e:
+                logger.error(f"❌ Ошибка при создании сделки или отправке кнопок: {e}")
+            await update.message.reply_text("⚠️ Не удалось предложить сделку. Попробуйте позже.")
+            return DIALOG
+
+        # Завершить диалог
+        if text == "❌ Завершить диалог":
+            return await end_chat(update, context)
+
+        # Написать другим продавцам
+        elif text == "✉️ Написать другим продавцам":
+            await update.message.reply_text("Выберите другого продавца из списка.")
+            return await back_to_sellers(update, context)
+
+        # Завершение сделки с оценкой
+        elif text == "⭐️ Завершить сделку":
+            return await finish_deal(update, context)
+
+        logger.warning(f"📨 сообщение от {sender_id} -> {receiver_id} отправлено успешно")
+    except Exception as e:
+        logger.error(f"❌ Ошибка при отправке сообщения: {e}")
+        await update.message.reply_text("⚠️ Не удалось доставить сообщение.")
+        return ConversationHandler.END
+
+    return DIALOG  # Остаёмся в диалоге
+
+async def get_nickname_by_user_id(user_id: int) -> str:
+    conn = sqlite3.connect(Config.DATABASE)
+    cursor = conn.cursor()
+
+    # Пробуем сначала из таблицы sellers
+    cursor.execute("SELECT nickname FROM sellers WHERE user_id = ? ORDER BY seller_id DESC LIMIT 1", (user_id,))
+    row = cursor.fetchone()
+    if row and row[0]:
+        conn.close()
+        return row[0]
+
+    # Пробуем из таблицы users
+    cursor.execute("SELECT nickname FROM users WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+
+    if row and row[0]:
+        return row[0]
+    
+    return f"id:{user_id}"  # fallback
+
+@cancel_if_requested
+async def confirm_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    deal_id = int(query.data.split("_")[2])
+
+    # Получаем buyer_id, seller_id и тип оплаты из БД
+    conn = sqlite3.connect(Config.DATABASE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT buyer_id, seller_id, payment_type FROM deals WHERE deal_id=?", (deal_id,))
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        await query.message.reply_text("❌ Сделка не найдена.")
+        return ConversationHandler.END
+
+    buyer_id, seller_id, payment_type = row
+    confirmer_id = query.from_user.id
+    receiver_id = seller_id if confirmer_id == buyer_id else buyer_id
+
+    # Отмечаем сделку как подтверждённую
+    context.user_data["deal_confirmed"] = True
+
+    try:
+        # Отправляем сообщение собеседнику
+        await context.bot.send_message(
+            chat_id=receiver_id,
+            text="✅ Сделка подтверждена собеседником. Можно переходить к следующему этапу!"
+        )
+
+        # Отправляем подтверждение тому, кто подтвердил
+        await query.message.reply_text("✅ Вы подтвердили сделку.")
+
+        # Отправляем информацию о сделке
+        await send_deal_intro(receiver_id, context)
+        await send_deal_intro(confirmer_id, context)
+
+        # Если тип оплаты — "direct", запускаем процедуру с реквизитами
+        if payment_type.lower() == "direct":
+            await handle_direct_payment(buyer_id, seller_id, deal_id, context)
+
+    except Exception as e:
+        logger.error(f"❌ Ошибка при подтверждении сделки: {e}")
+        await query.message.reply_text("❌ Произошла ошибка при подтверждении сделки.")
+
+    return DIALOG
+
+@cancel_if_requested
+async def cancel_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    deal_id = int(query.data.split("_")[2])
+
+    # Получаем участников сделки из БД
+    conn = sqlite3.connect(Config.DATABASE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT buyer_id, seller_id FROM deals WHERE deal_id = ?", (deal_id,))
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        await query.message.reply_text("❌ Сделка не найдена.")
+        return ConversationHandler.END
+
+    buyer_id, seller_id = row
+    sender_id = query.from_user.id
+    receiver_id = seller_id if sender_id == buyer_id else buyer_id
+
+    # Сообщаем участникам об отказе
+    try:
+        await context.bot.send_message(
+            chat_id=receiver_id,
+            text="❌ Собеседник отказался от начала сделки."
+        )
+        await query.message.reply_text("❌ Вы отменили сделку.")
+    except Exception as e:
+        logger.error(f"❌ Ошибка при отправке сообщения об отмене сделки: {e}")
+
+    return DIALOG
+
+@cancel_if_requested
+async def end_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    peer_id = active_chats.pop(user_id, None)
+
+    if peer_id:
+        active_chats.pop(peer_id, None)
+        reply_map.pop(user_id, None)
+        reply_map.pop(peer_id, None)
+
+        # Уведомляем собеседника
+        try:
+            await context.bot.send_message(
+                chat_id=peer_id,
+                text="❌ Собеседник завершил диалог."
+            )
+        except Exception as e:
+            logger.error(f"Ошибка при уведомлении собеседника: {e}")
+
+    # 🧹 Очищаем все связанные переменные
+    for key in ["reply_to", "selected_seller", "deal_confirmed", "active_deal_id", "awaiting_rating", "awaiting_comment"]:
+        context.user_data.pop(key, None)
+
+    await context.bot.send_message(
+        chat_id=user_id,
+        text="📴 Диалог завершён. Вы вернулись в главное меню.",
+        reply_markup=ReplyKeyboardRemove()  # или reply_markup=None
+    )
+    return await start(update, context)
+
+async def send_dialog_info(receiver_id: int, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "📦 *Это начало сделки.*\n\n"
+        "💬 На данном этапе вы можете обсудить условия сделки с собеседником.\n\n"
+        "💰 Когда будете готовы, нажмите одну из кнопок для совершения сделки:\n"
+        "• *Начать оплату* — оплата напрямую между участниками.\n"
+        "• *Эксроу-счёт* — деньги временно удерживаются ботом.\n\n"
+        "❗️❗️❗️ *ВНИМАНИЕ*, информация для покупателя:\n"
+        "Мы работаем исключительно с честными продавцами и верифицированными аккаунтами "
+        "(доказательствами, что аккаунт на платформе принадлежит продавцу). НО, мы не можем гарантировать 100% "
+        "безопасности при сделке напрямую между участниками, поскольку не имеем доступа к денежным средствам.\n\n"
+        "Выбирая *оплату напрямую*, вы автоматически берёте на себя все риски.\n\n"
+        "Если вы работаете с новым продавцом или продавец вызывает сомнения, *лучше используйте Эксроу-счёт*.\n\n"
+        "💼 *Эксроу-счёт* — вы переводите деньги на счёт бота → продавец выкладывает контент с вашей рекламой → "
+        "вы подтверждаете → деньги переходят на счёт продавца.\n\n"
+        "❗️❗️❗️*(КОМИССИИ НЕТУ)*❗️❗️❗️\n\n"
+        "🗣 *Жалобы на продавцов/покупателей:*\n"
+        "Если вы столкнулись с неадекватным продавцом или покупателем, либо вас обманули — оставьте жалобу. "
+        "Вам нужно будет указать на кого эта жалоба (покупатель или продавец) и что за жалоба. "
+        "Мы рассмотрим её и немедленно примем меры.\n\n"
+        "🔘 *Вы также можете:*\n"
+        "• Нажать кнопку *«❌ Завершить диалог»* для выхода в экстренном случае или в случае отказа работы с данным продавцом\n"
+        "• Нажать кнопку *«✉️ Написать другим продавцам»* чтобы совершать несколько сделок с несколькими продавцами одновременно\n"
+        "• Нажать кнопку *«⭐ Завершить сделку»* для оценки работы продавца и оставить свой комментарий\n\n"        
+        "Здесь вы переписываетесь как в обычных чатах, хорошей вам сделки!👍"
     )
 
-    return ConversationHandler.END
+    await context.bot.send_message(
+        chat_id=receiver_id,
+        text=text,
+        parse_mode="Markdown"
+    )
 
-# async def send_deal_intro(receiver_id: int, context: ContextTypes.DEFAULT_TYPE):
-#     text = (
-#         "📦 *Это начало сделки.*\n\n"
-#         "💬 На данном этапе вы можете обсудить условия сделки.\n\n"
-#         "💰 Когда будете готовы, кликните по одной из кнопок:\n"
-#         "• Начать оплату — оплата напрямую между участниками.\n"
-#         "• Эксроу-счет — деньги временно удерживаются ботом.\n\n"
-#         "❗️ Внимание:\n"
-#         "Начать оплату — бот не несёт ответственности за честность продавца. Оплачивайте только проверенным продавцам.\n"
-#         "Эксроу-счет — безопасный способ. Деньги передаются продавцу только после вашего подтверждения.\n\n"
-#         "🔘 Вы также можете:\n"
-#         "• Нажать кнопку *«❌ Завершить диалог»* для выхода\n"
-#         "• Нажать *«Написать другим продавцам»* для выбора нового\n"
-#         "• Нажать *«Жалоба на продавца»* при необходимости"
-#     )
+async def send_deal_intro(receiver_id: int, context: ContextTypes.DEFAULT_TYPE, is_buyer: bool = True):
+    text = (
+        "📦 *Это начало сделки.*\n\n"
+        "💬 На данном этапе вы можете обсудить условия сделки.\n\n"
+        "❗️❗️❗️ ВНИМАНИЕ:\n"
+        "Вы можете:\n"
+        "• Нажать кнопку *«❌ Завершить диалог»* для выхода\n"
+        "• Нажать *«⭐️ Завершить сделку»* для оценки работы продавца\n"
+        "• Нажать *«✉️ Написать другим продавцам»* чтобы совершать несколько сделок с несколькими продавцами одновременно\n"
+        "• Нажать *«🚨 Жалоба»* при необходимости"
+    )
 
-#     await context.bot.send_message(
-#         chat_id=receiver_id,
-#         text=text,
-#         parse_mode="Markdown",
-#         reply_markup=ReplyKeyboardMarkup(
-#             [
-#                 [KeyboardButton("❌ Завершить диалог")],
-#                 [KeyboardButton("Написать другим продавцам")],
-#                 [KeyboardButton("Жалоба на продавца")]
-#             ],
-#             resize_keyboard=True
-#         )
-#     )
+    keyboard = [
+        [KeyboardButton("❌ Завершить диалог")],
+        [KeyboardButton("⭐️ Завершить сделку")],
+        [KeyboardButton("✉️ Написать другим продавцам")],
+        [KeyboardButton("🚨 Жалоба")]
+    ]
 
-# async def create_new_deal(buyer_id, seller_id, payment_type):
-#     conn = sqlite3.connect(Config.DATABASE)
-#     cursor = conn.cursor()
-#     cursor.execute(
-#         "INSERT INTO deals (buyer_id, seller_id, status, payment_type) VALUES (?, ?, 'negotiation', ?)",
-#         (buyer_id, seller_id, payment_type)
-#     )
-#     conn.commit()
-#     deal_id = cursor.lastrowid
-#     conn.close()
-#     return deal_id
+    await context.bot.send_message(
+        chat_id=receiver_id,
+        text=text,
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    )
 
-# async def finish_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-#     deal_id = context.user_data.get('active_deal_id')
-#     if not deal_id:
-#         await update.message.reply_text("❌ Нет активной сделки.")
-#         return ConversationHandler.END
+async def create_new_deal(buyer_id, seller_id, payment_type):
+    conn = sqlite3.connect(Config.DATABASE)
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO deals (buyer_id, seller_id, status, payment_type) VALUES (?, ?, 'negotiation', ?)",
+        (buyer_id, seller_id, payment_type)
+    )
+    conn.commit()
+    deal_id = cursor.lastrowid
+    conn.close()
+    return deal_id
 
-#     # Спрашиваем оценку
-#     await update.message.reply_text("Поставьте оценку продавцу от 1 до 5:")
-#     context.user_data['awaiting_rating'] = deal_id
-#     return WAITING_FOR_RATING
+async def finish_deal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    deal_id = context.user_data.get('active_deal_id')
+    if not deal_id:
+        await update.message.reply_text("❌ Нет активной сделки.")
+        return DIALOG
 
-# async def receive_rating(update: Update, context: ContextTypes.DEFAULT_TYPE):
-#     rating = int(update.message.text.strip())
-#     deal_id = context.user_data.pop('awaiting_rating')
-#     context.user_data['awaiting_comment'] = (deal_id, rating)
+    context.user_data.pop("deal_confirmed", None)
 
-#     await update.message.reply_text("Можете оставить комментарий к сделке:")
-#     return WAITING_FOR_COMMENT
+    # Спрашиваем оценку
+    await update.message.reply_text("Поставьте оценку продавцу от 1 до 5:")
+    context.user_data['awaiting_rating'] = deal_id
+    return WAITING_FOR_RATING
 
-# async def view_comments(update: Update, context: ContextTypes.DEFAULT_TYPE):
-#     seller_id = int(update.callback_query.data.split('_')[2])
-#     conn = sqlite3.connect(Config.DATABASE)
-#     cursor = conn.cursor()
-#     cursor.execute("SELECT comment, rating FROM deals WHERE seller_id=? AND comment IS NOT NULL", (seller_id,))
-#     reviews = cursor.fetchall()
-#     conn.close()
+@cancel_if_requested
+async def receive_rating(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        rating = int(update.message.text.strip())
+        if not 1 <= rating <= 5:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❗️ Введите число от 1 до 5.")
+        return WAITING_FOR_RATING
 
-#     if not reviews:
-#         await update.callback_query.message.reply_text("🔹 Пока нет комментариев.")
-#     else:
-#         text = "\n\n".join([f"⭐️ {r[1]}: {r[0]}" for r in reviews])
-#         await update.callback_query.message.reply_text(f"💬 Комментарии о продавце:\n\n{text}")
+    deal_id = context.user_data.pop('awaiting_rating')
+    context.user_data['awaiting_comment'] = (deal_id, rating)
+
+    await update.message.reply_text("✏️ Можете оставить комментарий к сделке:")
+    return WAITING_FOR_COMMENT
+
+@cancel_if_requested
+async def receive_comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    deal_id, rating = context.user_data.pop('awaiting_comment', (None, None))
+    comment = update.message.text.strip()
+
+    if not deal_id or not rating:
+        await update.message.reply_text("❌ Не удалось сохранить комментарий.")
+        return ConversationHandler.END
+
+    conn = sqlite3.connect(Config.DATABASE)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE deals SET comment=?, rating=? WHERE deal_id=?", (comment, rating, deal_id))
+    conn.commit()
+    conn.close()
+
+    # 🧹 Очищаем все связанные переменные
+    for key in ["reply_to", "selected_seller", "deal_confirmed", "active_deal_id", "awaiting_rating", "awaiting_comment"]:
+        context.user_data.pop(key, None)
+
+    await context.bot.send_message(
+        chat_id=user_id,
+        text="📴 Диалог завершён. Вы вернулись в главное меню.",
+        reply_markup=ReplyKeyboardRemove()  # или reply_markup=None
+    )
+    return await start(update, context)
+
+async def view_comments(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    seller_id = int(update.callback_query.data.split('_')[2])
+    conn = sqlite3.connect(Config.DATABASE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT comment, rating FROM deals WHERE seller_id=? AND comment IS NOT NULL", (seller_id,))
+    reviews = cursor.fetchall()
+    conn.close()
+
+    if not reviews:
+        await update.callback_query.message.reply_text("🔹 Пока нет комментариев.")
+    else:
+        text = "\n\n".join([f"⭐️ {r[1]}: {r[0]}" for r in reviews])
+        await update.callback_query.message.reply_text(f"💬 Комментарии о продавце:\n\n{text}")
+
+
+# --- Функции для совершения сделки ---
+async def handle_direct_payment(buyer_id: int, seller_id: int, deal_id: int, context: ContextTypes.DEFAULT_TYPE):
+    # Получаем данные по сделке
+    conn = sqlite3.connect(Config.DATABASE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT buyer_id, seller_id FROM deals WHERE deal_id=?", (deal_id,))
+    buyer_id, seller_id = cursor.fetchone()
+    conn.close()
+
+    # Сохраняем текущую сделку
+    context.user_data["active_deal_id"] = deal_id
+    context.user_data["payment_type"] = "direct"
+
+    buyer_nickname = await get_nickname_by_user_id(buyer_id)
+    seller_nickname = await get_nickname_by_user_id(seller_id)
+
+    # Покупателю: ждите реквизиты
+    await context.bot.send_message(
+        chat_id=buyer_id,
+        text=f"💰Вы выбрали оплату напрямую, ожидайте, скоро продавец, {seller_nickname}, пришлёт вам реквизиты."
+    )
+
+    # Продавцу: пришлите реквизиты
+    context.user_data["awaiting_requisites_from"] = seller_id
+    await context.bot.send_message(
+        chat_id=seller_id,
+        text="💰Покупатель выбрал оплату напрямую. Укажите ваши реквизиты (номер карты/телефона, обязательно укажите банк) и сумму сделки:"
+    )
+
+    return AWAITING_REQUISITES
+
+async def receive_requisites(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    seller_id = update.effective_user.id
+    text = update.message.text.strip()
+    deal_id = context.user_data.get("active_deal_id")
+
+    # Получаем buyer_id
+    conn = sqlite3.connect(Config.DATABASE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT buyer_id FROM deals WHERE deal_id=?", (deal_id,))
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        await update.message.reply_text("❌ Сделка не найдена.")
+        return DIALOG
+
+    buyer_id = row[0]
+    buyer_nickname = await get_nickname_by_user_id(buyer_id)
+    seller_nickname = await get_nickname_by_user_id(seller_id)
+
+    # Отправляем покупателю
+    await context.bot.send_message(
+        chat_id=buyer_id,
+        text=(
+            f"💰Реквизиты продавца и сумма сделки, {seller_nickname}:\n"
+            f"*{text}*\n\n"
+            "❗️Сделайте перевод обговоренной суммы, далее нажмите на «Подтвердить перевод» и пришлите скриншот.\n"
+            "Помните, что администрация бота не несёт ответственности за ваши денежные средства.\n"
+            "Если вы договорились о постоплате (оплата после выполнения услуги), то можете продолжить диалог с продавцом и провести оплату позже."
+        ),
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📤 Отправить скриншот", callback_data="confirm_transfer")]
+        ])
+    )
+
+    await update.message.reply_text("✅ Реквизиты отправлены покупателю.")
+    return DIALOG
+
+async def confirm_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data["awaiting_payment_screenshot"] = True
+
+    await query.message.reply_text("📸 Пришлите скриншот перевода в ответ на это сообщение.")
+    return WAITING_FOR_SCREENSHOT
+
+async def receive_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.photo:
+        await update.message.reply_text("❗️Пожалуйста, пришлите изображение скриншота.")
+        return WAITING_FOR_SCREENSHOT
+
+    buyer_id = update.effective_user.id
+
+    deal_id = context.user_data.get("active_deal_id")
+    if not deal_id:
+        await update.message.reply_text("❌ Сделка не найдена.")
+        return DIALOG
+
+    # Очищаем флаг
+    context.user_data.pop("awaiting_payment_screenshot", None)
+
+    # Получаем seller_id
+    try:
+        conn = sqlite3.connect(Config.DATABASE)
+        cursor = conn.cursor()
+        cursor.execute("SELECT seller_id FROM deals WHERE deal_id=?", (deal_id,))
+        row = cursor.fetchone()
+        conn.close()
+
+        if not row:
+            await update.message.reply_text("❌ Сделка не найдена.")
+            return DIALOG
+
+        seller_id = row[0]
+        buyer_user = update.effective_user
+        buyer_name = await get_nickname_by_user_id(buyer_id)
+
+        await context.bot.send_photo(
+            chat_id=seller_id,
+            photo=update.message.photo[-1].file_id,
+            caption=(
+                f"💰Покупатель, {buyer_name}, оплатил услугу. Подтвердите получение денежных средств.\n\n"
+                "Нажмите одну из кнопок ниже:"
+            ),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Деньги пришли", callback_data=f"money_arrived_{deal_id}")],
+                [InlineKeyboardButton("❌ Деньги не пришли", callback_data=f"money_not_arrived_{deal_id}")]
+            ])
+        )
+
+        await update.message.reply_text("📤 Скриншот отправлен продавцу.")
+        return DIALOG
+
+    except Exception as e:
+        logger.error(f"❌ Ошибка при обработке скриншота: {e}")
+        await update.message.reply_text("⚠️ Произошла ошибка при отправке скриншота.")
+        return DIALOG
+
+
+# --------------- ОБРАБОТЧИКИ ПОДТВЕРЖДЕНИЯ ДЕНЕЖНЫХ СРЕДСТВ И НАОБОРОТ ------------------------
+async def money_arrived(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_reply_markup(reply_markup=None)
+
+    deal_id = int(query.data.split("_")[-1])
+    conn = sqlite3.connect(Config.DATABASE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT buyer_id, seller_id FROM deals WHERE deal_id=?", (deal_id,))
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        await query.message.reply_text("❌ Сделка не найдена.")
+        return DIALOG
+
+    buyer_id, seller_id = row
+
+    await context.bot.send_message(
+        chat_id=buyer_id,
+        text="✅ Продавец подтвердил получение оплаты. Вы можете продолжить общение и дождаться выполнения услуги.",
+        reply_markup=dialog_keyboard
+    )
+    await context.bot.send_message(
+        chat_id=seller_id,
+        text="✅ Вы подтвердили получение оплаты. Теперь можете продолжить выполнение услуги.",
+        reply_markup=dialog_keyboard
+    )
+    await context.bot.send_message(
+        chat_id=buyer_id,
+        text="🔔 Как только услуга будет полностью оказана, нажмите «⭐️ Завершить сделку» внизу чата, чтобы завершить её."
+    )
+
+    return DIALOG
+
+async def money_not_arrived(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_reply_markup(reply_markup=None)
+
+    deal_id = int(query.data.split("_")[-1])
+    conn = sqlite3.connect(Config.DATABASE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT buyer_id, seller_id FROM deals WHERE deal_id=?", (deal_id,))
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        await query.message.reply_text("❌ Сделка не найдена.")
+        return DIALOG
+
+    buyer_id, seller_id = row
+
+    # Отправляем сообщения покупателю и продавцу
+    await context.bot.send_message(
+        chat_id=buyer_id,
+        text="⚠️ Продавец указал, что деньги не пришли. Сделка передана модератору. Ожидайте.",
+        reply_markup=dialog_keyboard
+    )
+    await context.bot.send_message(
+        chat_id=seller_id,
+        text="⚠️ Вы указали, что деньги не поступили. Сделка передана модератору. Ожидайте.",
+        reply_markup=dialog_keyboard
+    )
+
+    # Получаем usernames для модератора
+    try:
+        buyer_user = await context.bot.get_chat(buyer_id)
+        seller_user = await context.bot.get_chat(seller_id)
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения чатов: {e}")
+        return DIALOG
+
+    buyer_name = f"@{buyer_user.username}" if buyer_user.username else f"{buyer_user.full_name} (ID: {buyer_user.id})"
+    seller_name = f"@{seller_user.username}" if seller_user.username else f"{seller_user.full_name} (ID: {seller_user.id})"
+
+    # Сообщение модератору
+    await context.bot.send_message(
+        chat_id=Config.ADMIN_CHAT_ID,
+        text=(
+            f"🆘 *Сделка #{deal_id} передана на модерацию*\n\n"
+            f"👤 Покупатель: {buyer_name} — {buyer_id}\n"
+            f"👤 Продавец: {seller_name} — {seller_id}\n"
+            f"Причина: Утеря денежных средств."
+        ),
+    )
+
+    return DIALOG
 
 
 # ОБРАБОТЧИКИ ДЛЯ ДЕСЙСТВИЙ АДМИНА
+
+# import re
+# def escape_markdown_v2(text: str) -> str:
+#     escape_chars = r'\_*[]()~`>#+-=|{}.!'
+#     return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
+
+# ------------- ОБРАБОТЧИКИ ДЛЯ КНОПКИ ЖАЛОБА -----------------
+async def start_complaint(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("✍️ Пожалуйста, опишите вашу жалобу (на кого эта жалоба, никнейм и покупатель/продавец, и что за жалоба). Она будет отправлена модератору.")
+    return WAITING_FOR_COMPLAINT
+
+async def receive_complaint(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    username = f"@{update.effective_user.username}" if update.effective_user.username else update.effective_user.full_name
+    complaint_text = update.message.text.strip()
+    # safe_text = escape_markdown(complaint_text)
+
+    await context.bot.send_message(
+        chat_id=Config.ADMIN_CHAT_ID,
+        text=(
+            f"🚨 НОВАЯ ЖАЛОБА❗\n\n"
+            f"👤 Пользователь: {username} (id:{user_id})\n"
+            f"💬 Текст жалобы:\n{complaint_text}"
+        ),
+        # parse_mode="Markdown"
+    )
+
+    await update.message.reply_text("✅ Жалоба отправлена. Спасибо за обратную связь.")
+    return DIALOG
+
+
+# --------------- ДРУГИЕ ОБРАБОТЧИКИ ДЛЯ АДМИНОВ ------------------
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Панель администратора для модерации заявок."""
     if update.effective_user.id not in Config.ADMIN_IDS:
@@ -1393,7 +1978,8 @@ def main() -> None:
             CallbackQueryHandler(admin_action, pattern=r'^(approve|reject)_\d+$'),
             CallbackQueryHandler(start_dialog_from_profile, pattern="^start_dialog$"),
             CallbackQueryHandler(buyer_platform, pattern="^back_to_platforms$"),
-            CallbackQueryHandler(seller_reply_start, pattern=r"^reply_to_\d+$")
+            CallbackQueryHandler(seller_reply_start, pattern=r"^reply_to_\d+$"),
+            CallbackQueryHandler(view_comments, pattern=r"^view_comments_\d+$")
         ],
         states={
             CHECK_SUBSCRIPTION: [
@@ -1441,9 +2027,21 @@ def main() -> None:
             REPLY_TO_BUYER: [MessageHandler(filters.TEXT & ~filters.COMMAND, seller_send_reply)],
 
             DIALOG: [
-                MessageHandler(filters.TEXT & filters.Regex("^(❌ Завершить диалог)$"), end_chat)
-                # MessageHandler(filters.TEXT & ~filters.COMMAND, dialog_handler)
+                MessageHandler(filters.TEXT & filters.Regex("^(❌ Завершить диалог)$"), end_chat),
+                MessageHandler(filters.TEXT & filters.Regex("^(⭐ Завершить сделку)$"), finish_deal),
+                MessageHandler(filters.TEXT & filters.Regex("^🚨 Жалоба"), start_complaint),
+                MessageHandler(filters.ALL & ~filters.COMMAND, dialog_handler),
+                CallbackQueryHandler(confirm_deal, pattern=r"^confirm_deal_\d+$"),
+                CallbackQueryHandler(cancel_deal, pattern=r"^cancel_deal_\d+$"),
+                CallbackQueryHandler(confirm_transfer, pattern=r"^confirm_transfer$"),
+                CallbackQueryHandler(money_arrived, pattern=r"^money_arrived_\d+$"),
+                CallbackQueryHandler(money_not_arrived, pattern=r"^money_not_arrived_\d+$")
             ],
+            WAITING_FOR_RATING: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_rating)],
+            WAITING_FOR_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_comment)],
+            AWAITING_REQUISITES: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_requisites)],
+            WAITING_FOR_SCREENSHOT: [MessageHandler(filters.PHOTO, receive_screenshot)],
+            WAITING_FOR_COMPLAINT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_complaint)],
         },
         fallbacks=[
             CommandHandler('cancel', cancel),
