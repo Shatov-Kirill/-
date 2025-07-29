@@ -131,7 +131,8 @@ dialog_keyboard = ReplyKeyboardMarkup(
         [KeyboardButton("💰 Начать оплату"), KeyboardButton("💼 Эксроу-счёт")],
         [KeyboardButton("❌ Завершить диалог")],
         [KeyboardButton("✉️ Написать другим продавцам")],
-        [KeyboardButton("⭐ Завершить сделку")]
+        [KeyboardButton("⭐ Завершить сделку")],
+        [KeyboardButton("🚨 Жалоба")]
     ],
     resize_keyboard=True,
     one_time_keyboard=False
@@ -182,6 +183,7 @@ def init_db():
         raise
     finally:
         conn.close() if 'conn' in locals() else None
+
 
 # --- Вспомогательные функции ---
 # --- Универсальная функция отказа по причине ---
@@ -410,9 +412,14 @@ async def group_message_filter(update: Update, context: ContextTypes.DEFAULT_TYP
     # Обработка сообщения дальше...
 
 # --- Основные обработчики ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id_override=None) -> int:
     """Начало взаимодействия с ботом."""
     try:
+        if user_id_override:
+            user_id = user_id_override
+        else:
+            user_id = update.effective_user.id
+
         user = update.effective_user
         await save_user(user.id, user.username, user.first_name, user.last_name, 'unassigned')
         
@@ -1208,7 +1215,8 @@ async def dialog_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         keyboard = ReplyKeyboardMarkup([
             [KeyboardButton("💰 Начать оплату"), KeyboardButton("💼 Эксроу-счёт")],
             [KeyboardButton("❌ Завершить диалог"), KeyboardButton("⭐️ Завершить сделку")],
-            [KeyboardButton("✉️ Написать другим продавцам")]
+            [KeyboardButton("✉️ Написать другим продавцам")],
+            [KeyboardButton("🚨 Жалоба")],
         ], resize_keyboard=True)
     else:
         # Показываем клавиатуру после подтверждения сделки
@@ -1262,8 +1270,11 @@ async def dialog_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("✅ Подтвердить", callback_data=f"confirm_deal_{deal_id}")],
                         [InlineKeyboardButton("❌ Отказаться", callback_data=f"cancel_deal_{deal_id}")]
-                ])
-            )
+                    ])
+                )
+
+                if payment_type == "direct":
+                    await handle_direct_payment(sender_id)
 
                 await update.message.reply_text("⏳ Ожидаем подтверждения от собеседника.")
                 return DIALOG
@@ -1357,7 +1368,8 @@ async def confirm_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Если тип оплаты — "direct", запускаем процедуру с реквизитами
         if payment_type.lower() == "direct":
             await handle_direct_payment(buyer_id, seller_id, deal_id, context)
-
+        elif payment_type.lower() == "escrow":
+            await handle_escrow_payment(buyer_id, seller_id, deal_id, context)
     except Exception as e:
         logger.error(f"❌ Ошибка при подтверждении сделки: {e}")
         await query.message.reply_text("❌ Произошла ошибка при подтверждении сделки.")
@@ -1398,6 +1410,8 @@ async def cancel_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     return DIALOG
 
+
+# -------------------- СТАРЫЙ end_chat --------------------
 @cancel_if_requested
 async def end_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
@@ -1423,10 +1437,50 @@ async def end_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     await context.bot.send_message(
         chat_id=user_id,
-        text="📴 Диалог завершён. Вы вернулись в главное меню.",
+        text="📴 Вы завершили диалог. Возвращаемся в главное меню.",
         reply_markup=ReplyKeyboardRemove()  # или reply_markup=None
     )
+    
     return await start(update, context)
+
+
+# --------------- НОВЫЙ end_chat ----------------
+# @cancel_if_requested
+# async def end_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+#     user_id = update.effective_user.id
+#     peer_id = active_chats.pop(user_id, None)
+
+#     if peer_id:
+#         active_chats.pop(peer_id, None)
+
+#         # 🧹 Очищаем переменные у текущего пользователя
+#         for key in ["reply_to", "selected_seller", "deal_confirmed", "active_deal_id", "awaiting_rating", "awaiting_comment"]:
+#             context.user_data.pop(key, None)
+
+#         # Уведомляем собеседника и сбрасываем ему меню
+#         try:
+#             await context.bot.send_message(
+#                 chat_id=peer_id,
+#                 text="❌ Собеседник завершил диалог. Напишите команду /start, чтобы вернуться в начало, если вы хотите найти другого продавца.",
+#                 reply_markup=ReplyKeyboardRemove()
+#             )
+#             await start(update, context, user_id_override=peer_id)
+#         except Exception as e:
+#             logger.error(f"Ошибка при возврате собеседника в старт: {e}")
+
+#         # Возвращаем инициатора в меню
+#         await context.bot.send_message(
+#             chat_id=user_id,
+#             text="📴 Вы завершили диалог. Возвращаемся в главное меню.",
+#             reply_markup=ReplyKeyboardRemove()
+#         )
+#         await start(update, context, user_id_override=user_id)
+
+#         return ConversationHandler.END
+#     else:
+#         await update.message.reply_text("❌ Диалог уже завершён.")
+#         await start(update, context, user_id_override=user_id)
+#         return ConversationHandler.END
 
 async def send_dialog_info(receiver_id: int, context: ContextTypes.DEFAULT_TYPE):
     text = (
@@ -1569,7 +1623,7 @@ async def view_comments(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.message.reply_text(f"💬 Комментарии о продавце:\n\n{text}")
 
 
-# --- Функции для совершения сделки ---
+# --- Функции для совершения сделки "Начать оплату"---
 async def handle_direct_payment(buyer_id: int, seller_id: int, deal_id: int, context: ContextTypes.DEFAULT_TYPE):
     # Получаем данные по сделке
     conn = sqlite3.connect(Config.DATABASE)
@@ -2045,7 +2099,6 @@ def main() -> None:
         },
         fallbacks=[
             CommandHandler('cancel', cancel),
-            CommandHandler('end_chat', end_chat),
             CallbackQueryHandler(cancel, pattern='^cancel$'),
         ],
         per_message=False,
