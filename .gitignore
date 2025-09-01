@@ -2,6 +2,11 @@
 __pycache__/
 venv/
 *.log
+*.txt
 # Базы данных
 *.sqlite
 *.db
+# Не нужные файлы с кодом
+bot.py
+bot2.py
+testBot.py
