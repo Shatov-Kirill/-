@@ -2,3 +2,6 @@
 __pycache__/
 venv/
 *.log
+# Базы данных
+*.sqlite
+*.db

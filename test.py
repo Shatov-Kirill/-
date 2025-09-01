@@ -94,7 +94,18 @@ def log_sql(query, params=None):
     AWAITING_REQUISITES, WAITING_FOR_SCREENSHOT, WAITING_FOR_COMPLAINT
 ) = range(26)
 # Здесь был SELLER_REPLY вместо REPLY_TO_BUYER
+# ESCROW_WAITING_FOR_REQUISITES = 100
+# ESCROW_WAITING_FOR_SCREENSHOT = 100
+# ESCROW_WAITING_FOR_ADMIN_CONFIRM = 101
+# ESCROW_WAITING_FOR_PAYOUT_REQUISITES = 102
+# ESCROW_WAITING_FOR_PAYOUT_CONFIRM = 103
 
+# --- Состояния для escrow ---
+ESCROW_START = 100
+ESCROW_WAITING_FOR_SCREENSHOT = 101
+ESCROW_WAITING_FOR_ADMIN_CONFIRM = 102
+ESCROW_WAITING_FOR_PAYOUT_REQUISITES = 103
+ESCROW_FINISHED = 104
 
 # --- Клавиатуры ---
 KEYBOARDS = {
@@ -184,6 +195,22 @@ def init_db():
     finally:
         conn.close() if 'conn' in locals() else None
 
+def update_deals_table():
+    conn = sqlite3.connect("bot_db.sqlite")  # Укажи путь к своей базе
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("ALTER TABLE deals ADD COLUMN escrow_stage TEXT DEFAULT NULL;")
+    except sqlite3.OperationalError:
+        pass  # колонка уже есть
+
+    try:
+        cursor.execute("ALTER TABLE deals ADD COLUMN escrow_requisites TEXT DEFAULT NULL;")
+    except sqlite3.OperationalError:
+        pass  # колонка уже есть
+
+    conn.commit()
+    conn.close()
 
 # --- Вспомогательные функции ---
 # --- Универсальная функция отказа по причине ---
@@ -1157,8 +1184,13 @@ async def seller_send_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 @cancel_if_requested
 async def dialog_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if context.user_data.get("awaiting_payment_screenshot") and update.message.photo:
-        return await receive_screenshot(update, context)
+    # Ожидание скриншота обычной оплаты
+    # if context.user_data.get("awaiting_payment_screenshot") and update.message and update.message.photo:
+    #     return await receive_screenshot(update, context)
+
+    # # Ожидание скриншота ускроу-счёта
+    # if context.user_data.get("awaiting_escrow_screenshot") and update.message and update.message.photo:
+    #     return await escrow_receive_screenshot(update, context)
 
     if not update.message or not update.message.text:
         logger.warning("Получено не текст - возможно, фото.")
@@ -1173,6 +1205,10 @@ async def dialog_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if context.user_data.get("awaiting_requisites_from") == sender_id:
         context.user_data.pop("awaiting_requisites_from", None)
         return await receive_requisites(update, context)
+
+    if context.user_data.get("awaiting_escrow_requisites") == sender_id:
+        context.user_data.pop("awaiting_escrow_requisites", None)
+        return await escrow_confirm_payout(update, context)
 
     logger.warning(f"📸 Фото пришло? {bool(update.message.photo)}, Флаг: {context.user_data.get('awaiting_payment_screenshot')}")
 
@@ -1369,7 +1405,7 @@ async def confirm_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if payment_type.lower() == "direct":
             await handle_direct_payment(buyer_id, seller_id, deal_id, context)
         elif payment_type.lower() == "escrow":
-            await handle_escrow_payment(buyer_id, seller_id, deal_id, context)
+            await start_escrow(update, context)
     except Exception as e:
         logger.error(f"❌ Ошибка при подтверждении сделки: {e}")
         await query.message.reply_text("❌ Произошла ошибка при подтверждении сделки.")
@@ -1755,6 +1791,173 @@ async def receive_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return DIALOG
 
 
+# ------------------------- ФУНКЦИИ ДЛЯ СОВЕРШЕНИЯ СДЕЛКИ escrow --------------------------
+# --- Этап 1: Покупатель выбирает Эскроу ---
+async def start_escrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    buyer_id = update.effective_user.id
+    receiver_id = active_chats.get(buyer_id)
+
+    if not receiver_id:
+        await update.effective_message.reply_text("❌ Невозможно начать сделку, собеседник не найден.")
+        return ConversationHandler.END
+
+    deal_id = await create_new_deal(buyer_id, receiver_id, "escrow")
+    context.user_data["escrow_deal_id"] = deal_id
+    context.user_data["payment_type"] = "escrow"
+
+    # Покупателю: реквизиты + кнопка отправки скриншота
+    await update.effective_message.reply_text(
+        "💰Вы выбрали оплату через эскроу-счёт.\n"
+        "Переведите деньги на реквизиты: 1234 5678 9012 3456 (Банк Тест)\n\n"
+        "После перевода нажмите кнопку «📤 Отправить скриншот».",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📤 Отправить скриншот", callback_data="escrow_send_screenshot")]
+        ])
+    )
+
+    return ESCROW_START
+# --- Этап 2: Нажата кнопка для отправки скриншота ---
+async def escrow_send_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    await query.message.reply_text("📸 Пришлите фото скриншота перевода.")
+    return ESCROW_WAITING_FOR_SCREENSHOT
+# --- Этап 3: Получение скриншота ---
+async def escrow_receive_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.photo:
+        await update.effective_message.reply_text("❗ Пришлите именно фото скриншота.")
+        return ESCROW_WAITING_FOR_SCREENSHOT
+
+    deal_id = context.user_data.get("escrow_deal_id")
+    buyer_id = update.effective_user.id
+    buyer_name = await get_nickname_by_user_id(buyer_id)
+
+    # Отправляем модерации
+    await context.bot.send_photo(
+        chat_id=Config.ADMIN_CHAT_ID,
+        photo=update.message.photo[-1].file_id,
+        caption=(
+            f"💳 *Escrow сделка #{deal_id}*\n"
+            f"Покупатель: {buyer_name} ({buyer_id})\n\n"
+            "✳ Подтвердите получение денежных средств."
+        ),
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Деньги пришли", callback_data=f"escrow_money_arrived_{deal_id}")],
+            [InlineKeyboardButton("❌ Деньги не пришли", callback_data=f"escrow_money_not_arrived_{deal_id}")]
+        ])
+    )
+
+    await update.effective_message.reply_text("✅ Скриншот отправлен модератору.")
+    return ESCROW_WAITING_FOR_ADMIN_CONFIRM
+
+async def escrow_money_arrived(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    deal_id = int(query.data.split("_")[-1])
+    conn = sqlite3.connect(Config.DATABASE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT buyer_id, seller_id FROM deals WHERE deal_id=?", (deal_id,))
+    buyer_id, seller_id = cursor.fetchone()
+    conn.close()
+
+    await context.bot.send_message(
+        chat_id=buyer_id,
+        text="✅ Модератор подтвердил получение средств. Деньги на эскроу-счёте."
+    )
+    await context.bot.send_message(
+        chat_id=seller_id,
+        text="✅ Деньги находятся на эскроу-счёте. После выполнения услуги они будут переведены вам."
+    )
+
+    return ESCROW_WAITING_FOR_PAYOUT_REQUISITES
+
+async def escrow_money_not_arrived(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    deal_id = int(query.data.split("_")[-1])
+    conn = sqlite3.connect(Config.DATABASE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT buyer_id FROM deals WHERE deal_id=?", (deal_id,))
+    buyer_id = cursor.fetchone()[0]
+    conn.close()
+
+    buyer_name = await get_nickname_by_user_id(buyer_id)
+
+    await context.bot.send_message(
+        chat_id=Config.ADMIN_CHAT_ID,
+        text=f"⚠️ Escrow сделка #{deal_id} — деньги не поступили.\n"
+             f"Свяжитесь с покупателем: {buyer_name} (@{buyer_id})"
+    )
+
+# --- Этап 4: Продавец подтверждает передачу ---
+# async def escrow_confirm_payout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+#     query = update.callback_query
+#     await query.answer()
+#     deal_id = int(query.data.split("_")[-1])
+
+#     context.user_data["awaiting_escrow_requisites"] = True
+#     await query.message.reply_text("💳 Укажите реквизиты для получения средств:")
+#     return AWAITING_REQUISITES
+
+
+# async def escrow_receive_requisites(update: Update, context: ContextTypes.DEFAULT_TYPE):
+#     if not context.user_data.get("awaiting_escrow_requisites"):
+#         return DIALOG
+
+#     seller_id = update.effective_user.id
+#     deal_id = context.user_data.get("active_deal_id")
+#     requisites = update.message.text.strip()
+
+#     context.user_data.pop("awaiting_escrow_requisites", None)
+
+#     # Сохраняем в БД
+#     conn = sqlite3.connect(Config.DATABASE)
+#     cursor = conn.cursor()
+#     cursor.execute("UPDATE deals SET escrow_requisites=? WHERE deal_id=?", (requisites, deal_id))
+#     conn.commit()
+#     conn.close()
+
+#     # Отправляем модерации
+#     await context.bot.send_message(
+#         chat_id=Config.ADMIN_CHAT_ID,
+#         text=(
+#             f"💼 Эксроу-выплата #{deal_id}\n"
+#             f"Реквизиты продавца: {requisites}"
+#         ),
+#         reply_markup=InlineKeyboardMarkup([
+#             [InlineKeyboardButton("✅ Выплата произведена", callback_data=f"escrow_payout_done_{deal_id}")]
+#         ])
+#     )
+
+#     await update.message.reply_text("✅ Реквизиты отправлены модерации.")
+#     return DIALOG
+
+
+# # --- Этап 5: Модерация подтверждает выплату ---
+# async def escrow_payout_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+#     query = update.callback_query
+#     await query.answer()
+#     deal_id = int(query.data.split("_")[-1])
+
+#     # Получаем продавца
+#     conn = sqlite3.connect(Config.DATABASE)
+#     cursor = conn.cursor()
+#     cursor.execute("SELECT seller_id FROM deals WHERE deal_id=?", (deal_id,))
+#     seller_id = cursor.fetchone()[0]
+#     conn.close()
+
+#     await context.bot.send_message(
+#         chat_id=seller_id,
+#         text="✅ Выплата произведена. Подтвердите получение средств."
+#     )
+
+#     # Завершение после подтверждения
+
+
 # --------------- ОБРАБОТЧИКИ ПОДТВЕРЖДЕНИЯ ДЕНЕЖНЫХ СРЕДСТВ И НАОБОРОТ ------------------------
 async def money_arrived(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2022,6 +2225,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 def main() -> None:
     """Запуск бота."""
     init_db()  # Инициализация базы данных
+    update_deals_table() # Добавляем новые колонки в БД
     
     application = Application.builder().token(Config.TOKEN).build()
     
@@ -2033,7 +2237,8 @@ def main() -> None:
             CallbackQueryHandler(start_dialog_from_profile, pattern="^start_dialog$"),
             CallbackQueryHandler(buyer_platform, pattern="^back_to_platforms$"),
             CallbackQueryHandler(seller_reply_start, pattern=r"^reply_to_\d+$"),
-            CallbackQueryHandler(view_comments, pattern=r"^view_comments_\d+$")
+            CallbackQueryHandler(view_comments, pattern=r"^view_comments_\d+$"),
+            CallbackQueryHandler(escrow_send_screenshot, pattern="^escrow_send_screenshot$")
         ],
         states={
             CHECK_SUBSCRIPTION: [
@@ -2090,12 +2295,36 @@ def main() -> None:
                 CallbackQueryHandler(confirm_transfer, pattern=r"^confirm_transfer$"),
                 CallbackQueryHandler(money_arrived, pattern=r"^money_arrived_\d+$"),
                 CallbackQueryHandler(money_not_arrived, pattern=r"^money_not_arrived_\d+$")
+                # CallbackQueryHandler(escrow_send_screenshot, pattern="^escrow_send_screenshot$"),
+                # MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, escrow_receive_screenshot),
+                # CallbackQueryHandler(escrow_money_arrived, pattern=r"^escrow_money_arrived_\d+$"),
+                # CallbackQueryHandler(escrow_money_not_arrived, pattern=r"^escrow_money_not_arrived_\d+$"),
+                # CallbackQueryHandler(escrow_confirm_payout, pattern=r"^escrow_confirm_payout_\d+$"),
+                # MessageHandler(filters.TEXT & filters.ChatType.PRIVATE, escrow_receive_requisites),
+                # CallbackQueryHandler(escrow_payout_done, pattern=r"^escrow_payout_done_\d+$")
             ],
             WAITING_FOR_RATING: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_rating)],
             WAITING_FOR_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_comment)],
             AWAITING_REQUISITES: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_requisites)],
             WAITING_FOR_SCREENSHOT: [MessageHandler(filters.PHOTO, receive_screenshot)],
             WAITING_FOR_COMPLAINT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_complaint)],
+            
+            ESCROW_START: [
+                # Нажатие кнопки "📤 Отправить скриншот"
+                CallbackQueryHandler(escrow_send_screenshot, pattern="^escrow_send_screenshot$"),
+            ],
+            ESCROW_WAITING_FOR_SCREENSHOT: [
+                # Ожидаем фото от покупателя
+                MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, escrow_receive_screenshot),
+            ],
+            ESCROW_WAITING_FOR_ADMIN_CONFIRM: [
+                # Модерация подтверждает или отклоняет
+                CallbackQueryHandler(escrow_money_arrived, pattern=r"^escrow_money_arrived_\d+$"),
+                CallbackQueryHandler(escrow_money_not_arrived, pattern=r"^escrow_money_not_arrived_\d+$"),
+            ],
+            ESCROW_WAITING_FOR_PAYOUT_REQUISITES: [
+                # Позже можно сюда добавить этапы с реквизитами продавца
+            ],
         },
         fallbacks=[
             CommandHandler('cancel', cancel),
@@ -2121,6 +2350,8 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(cancel_reject, pattern='^cancel_reject_'))
 
     application.add_handler(CallbackQueryHandler(admin_action, pattern='^(approve|reject)'))
+
+    # application.add_handler(escrow_handler)
     
     application.run_polling()
 
